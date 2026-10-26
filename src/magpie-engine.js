@@ -7,6 +7,7 @@ import net from 'node:net'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loopbackFetch } from './loopback-fetch.js'
+import { hasEnginePayload, materializeEngine } from './engine-payload.js'
 import {
   POLICY_REFUSED, assertEngineMutation, deniedLookup, filterEngineJSON, policyMutation, policyResponse,
 } from './magpie-policy.js'
@@ -63,8 +64,8 @@ function localPath(value) {
   return url.pathname + url.search
 }
 
-function validatePrefix(value) {
-  if (typeof value !== 'string' || !value.endsWith(MAGPIE_UI_PREFIX) ||
+function validatePrefix(value, mount = MAGPIE_UI_PREFIX) {
+  if (typeof value !== 'string' || !value.endsWith(mount) ||
     !/^\/[A-Za-z0-9/._~%-]+$/.test(value) || localPath(value) !== value) {
     throw engineError('Invalid engine UI prefix', 400)
   }
@@ -74,14 +75,15 @@ function validatePrefix(value) {
 function visiblePrefix(req, options) {
   const raw = String(req.url || '/')
   const pathname = raw.split('?')[0]
-  const marker = MAGPIE_UI_PREFIX.slice(0, -1)
+  const mount = options?.mount ?? MAGPIE_UI_PREFIX
+  const marker = mount.slice(0, -1)
   const index = pathname.indexOf(marker)
   const derived = index >= 0 && ['', '/'].includes(pathname[index + marker.length] || '')
-    ? pathname.slice(0, index) + MAGPIE_UI_PREFIX : MAGPIE_UI_PREFIX
+    ? pathname.slice(0, index) + mount : mount
   // A stripped outer mount cannot be inferred from headers. The browser bridge
   // carries its visible path as a validated path-only hint, removed upstream.
   const hint = new URL(raw, 'http://127.0.0.1').searchParams.get(PREFIX_HINT)
-  return validatePrefix(options?.prefix ?? hint ?? derived)
+  return validatePrefix(options?.prefix ?? hint ?? derived, mount)
 }
 
 function routePath(destination) {
@@ -265,10 +267,10 @@ async function writeJSON(file, value) {
 
 // Executed before upstream scripts. Relative assets use <base>; dynamically
 // assigned root URLs (including plugin frames and downloads) keep the prefix.
-function browserBridge(prefix) {
+function browserBridge(prefix, mount = MAGPIE_UI_PREFIX) {
   return `(() => {
 const configuredPrefix = ${JSON.stringify(prefix)};
-const route = ${JSON.stringify(MAGPIE_UI_PREFIX)};
+const route = ${JSON.stringify(mount)};
 const current = new URL(location.href);
 const index = current.pathname.indexOf(route.slice(0, -1));
 const prefix = index >= 0 && ["", "/"].includes(current.pathname[index + route.length - 1] || "")
@@ -572,7 +574,7 @@ function engineDisplayControls() {
   }
 }
 
-function rewriteHTML(html, pathname, prefix) {
+function rewriteHTML(html, pathname, prefix, mount = MAGPIE_UI_PREFIX) {
   const plugin = pathname.startsWith('/_magpie/plugin/')
   const relativeRoot = plugin ? '../'.repeat(pathname.split('/').filter(Boolean).length - 1) : ''
   html = html.replace(/\b(src|href|action|poster)=(["'])\/(?!\/)(.*?)\2/gi,
@@ -590,7 +592,7 @@ function rewriteHTML(html, pathname, prefix) {
     html = html.replace(/<script\b[^>]*\bsrc=(["'])(?:\.\/)?start\.js(?:\?[^"']*)?\1[^>]*>\s*<\/script>/i,
       match => `<script>(${engineDisplayControls.toString()})();</script>${match}`)
   }
-  const injection = `<base href="${prefix}"><script>${browserBridge(prefix)}</script>${appearance}`
+  const injection = `<base href="${prefix}"><script>${browserBridge(prefix, mount)}</script>${appearance}`
   return /<head\b[^>]*>/i.test(html)
     ? html.replace(/<head\b[^>]*>/i, match => match + injection)
     : injection + html
@@ -631,7 +633,7 @@ export function createMagpieEngine({ dataDir, logger, binary } = {}) {
   try { metadata = JSON.parse(readFileSync(path.join(vendor, 'engine.json'), 'utf8')) } catch {}
   const target = `${process.platform}-${process.arch}`
   const entry = metadata.binaries?.[target]
-  const executable = binary ? path.resolve(binary) : path.join(vendor, 'bin', `magpie-${target}${process.platform === 'win32' ? '.exe' : ''}`)
+  let executable = binary ? path.resolve(binary) : path.join(vendor, 'bin', `magpie-${target}${process.platform === 'win32' ? '.exe' : ''}`)
   const home = path.join(dataDir, 'magpie')
   let state = 'stopped'
   let error = null
@@ -650,7 +652,7 @@ export function createMagpieEngine({ dataDir, logger, binary } = {}) {
   let recovering = Promise.resolve()
   const active = new Set()
   const status = () => ({
-    state, available: existsSync(executable), version: metadata.version || null,
+    state, available: existsSync(executable) || (!binary && hasEnginePayload(fileURLToPath(new URL('../', import.meta.url)), entry)), version: metadata.version || null,
     revision: metadata.revision || null, error,
   })
   const note = () => {
@@ -683,6 +685,10 @@ export function createMagpieEngine({ dataDir, logger, binary } = {}) {
   const boot = async () => {
     await recovering
     assertOpen()
+    if (!binary && !existsSync(executable) && entry?.compressed) {
+      executable = await materializeEngine({ pkgDir: fileURLToPath(new URL('../', import.meta.url)), dataDir, entry })
+      assertOpen()
+    }
     if (!existsSync(executable)) throw engineError('Magpie engine binary is unavailable')
     const beside = path.dirname(await realpath(executable))
     if (existsSync(path.join(beside, '.portable')) || existsSync(path.join(beside, 'data'))) {
@@ -911,6 +917,9 @@ export function createMagpieEngine({ dataDir, logger, binary } = {}) {
     let pathname
     let prefix
     let forwardedBody
+    // The mount outlives the try block: the response handler rewrites HTML for
+    // it long after the preflight checks have finished.
+    const mount = options.mount ?? MAGPIE_UI_PREFIX
     try {
       if (typeof subpath !== 'string' || /^[a-z][a-z0-9+.-]*:/i.test(subpath)) throw engineError('Invalid engine path', 400)
       destination = localPath(subpath.startsWith('/') ? subpath : `/${subpath}`)
@@ -1031,7 +1040,7 @@ export function createMagpieEngine({ dataDir, logger, binary } = {}) {
               let value
               try { value = JSON.parse(raw.toString('utf8')) } catch { value = undefined }
               body = value === undefined ? raw : Buffer.from(JSON.stringify(filterEngineJSON(pathname, value)))
-            } else body = Buffer.from(rewriteHTML(raw.toString('utf8'), pathname, prefix))
+            } else body = Buffer.from(rewriteHTML(raw.toString('utf8'), pathname, prefix, mount))
             for (const key of ['content-length', 'content-encoding', 'etag', 'last-modified', 'accept-ranges', 'content-range']) delete outgoing[key]
             outgoing['content-length'] = body.length
             outgoing['cache-control'] = 'no-store'

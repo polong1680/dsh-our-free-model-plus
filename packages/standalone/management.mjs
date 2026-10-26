@@ -10,6 +10,7 @@ import { createWorkbench } from './workbench.mjs'
 import { createProviderManagement } from './providers.mjs'
 import { createWorkbenchLibrary } from './library.mjs'
 import { createRoutingManagement } from './routing.mjs'
+import { createDesktopUpdater } from './desktop-update.mjs'
 import { DISCLAIMER, DISCLAIMER_VERSION, disclaimerAcknowledged } from '../../src/disclaimer.js'
 
 const PREFIX = '/api/management'
@@ -87,7 +88,11 @@ export function managementSettings(value) {
 }
 
 /** 管理读写要求鉴权；登录恢复仅允许同源页面触发固定本机动作。 */
-export function createManagement({ stores, runtime, channels, eac, subscriptions, workbenchOptions, info, onSettingsChanged, loginTerminal = openLoginTerminal }) {
+export function createManagement({ stores, runtime, channels, eac, subscriptions, workbenchOptions, magpieEngine, magpieModels, onEngineStarted, onSubscriptionsChanged, info, onSettingsChanged, loginTerminal = openLoginTerminal, desktopPlatform = process.platform, desktopArch = process.arch }) {
+  // `desktopPlatform`/`desktopArch` are threaded from the caller instead of read
+  // from `process` so the Windows-only update flow stays exercisable on a test
+  // runner that is neither (`desktop-update.mjs` already takes them this way).
+  const desktopUpdate = createDesktopUpdater({ dataDir: info().dataDir, version: process.env.OFM_DESKTOP_VERSION, platform: desktopPlatform, arch: desktopArch })
   let bootstrap = { token: crypto.randomBytes(32).toString('base64url'), until: Date.now() + BOOTSTRAP_MS }
   const sessions = new Map()
   const privilegedSessions = new Set()
@@ -219,14 +224,24 @@ export function createManagement({ stores, runtime, channels, eac, subscriptions
       })
       return
     }
-    if (!authenticated(req)) throw fail(401, '请先登录管理页面')
     const privilegedManagementRoute =
+      pathname === `${PREFIX}/desktop-update` || pathname.startsWith(`${PREFIX}/desktop-update/`)
+      ||
       pathname === `${PREFIX}/workbench` || pathname.startsWith(`${PREFIX}/workbench/`)
       || pathname === `${PREFIX}/library` || pathname.startsWith(`${PREFIX}/library/`)
       || pathname === `${PREFIX}/providers` || pathname.startsWith(`${PREFIX}/providers/`)
       || pathname === `${PREFIX}/subscriptions` || pathname.startsWith(`${PREFIX}/subscriptions/`)
       || pathname === `${PREFIX}/routing` || pathname.startsWith(`${PREFIX}/routing/`)
-    if (privilegedManagementRoute && !sessionAuthenticated(req)) {
+      || pathname === `${PREFIX}/engine` || pathname.startsWith(`${PREFIX}/engine/`)
+    // A sandboxed plugin page inside the workspace carries a per-run HMAC
+    // capability in its own path; it has an opaque origin and cannot send this
+    // console's session. The engine validates the capability and serves only
+    // that plugin's files, exactly as it does for the plugin build. This has to
+    // be decided before the session check for the same reason.
+    const enginePluginAsset = ['GET', 'HEAD'].includes(req.method)
+      && /^\/api\/management\/engine\/ui\/_magpie\/plugin\/[a-f0-9]{32}\/[^?]+$/.test(pathname)
+    if (!authenticated(req) && !enginePluginAsset) throw fail(401, '请先登录管理页面')
+    if (privilegedManagementRoute && !sessionAuthenticated(req) && !enginePluginAsset) {
       throw fail(403, '此管理操作需要已登录的本地管理会话')
     }
     if (method === 'POST' && pathname === `${PREFIX}/logout`) {
@@ -234,10 +249,53 @@ export function createManagement({ stores, runtime, channels, eac, subscriptions
       sessions.delete(cookie(req))
       privilegedSessions.delete(cookie(req))
       json(res, 200, { ok: true }, { 'set-cookie': clearCookie() })
+    } else if (pathname === `${PREFIX}/desktop-update` && method === 'GET') {
+      json(res, 200, desktopUpdate.status())
+    } else if (pathname === `${PREFIX}/desktop-update/check` && method === 'POST') {
+      await readBody(req)
+      json(res, 200, desktopUpdate.check())
+    } else if (pathname === `${PREFIX}/desktop-update/download` && method === 'POST') {
+      await readBody(req)
+      json(res, 200, desktopUpdate.download())
     } else if (method === 'GET' && pathname === `${PREFIX}/summary`) {
       json(res, 200, summary())
     } else if (method === 'GET' && pathname === `${PREFIX}/stats`) {
       json(res, 200, buildStats(stores.stats.get(), runtime.catalog))
+    } else if (method === 'GET' && pathname === `${PREFIX}/engine/status`) {
+      json(res, 200, magpieEngine?.status() ?? { state: 'unavailable', available: false })
+    } else if (method === 'POST' && pathname === `${PREFIX}/engine/start`) {
+      await readBody(req)
+      if (!magpieEngine) throw fail(503, '模型工作台不可用')
+      await magpieEngine.start()
+      await magpieModels?.refresh()
+      onEngineStarted?.()
+      json(res, 200, magpieEngine.status())
+    } else if (method === 'POST' && pathname === `${PREFIX}/engine/refresh`) {
+      await readBody(req)
+      if (!magpieEngine) throw fail(503, '模型工作台不可用')
+      await magpieModels?.refresh()
+      json(res, 200, { ok: true })
+    } else if (pathname === `${PREFIX}/engine/ui` || pathname.startsWith(`${PREFIX}/engine/ui/`)) {
+      if (!magpieEngine) throw fail(503, '模型工作台不可用')
+      if (magpieEngine.status().state !== 'ready') throw fail(503, '模型工作台尚未启动')
+      if (pathname === `${PREFIX}/engine/ui` && !req.url.endsWith('/')) {
+        res.writeHead(302, { location: `${PREFIX}/engine/ui/` })
+        return res.end()
+      }
+      // The embedded page is same-origin HTML that the engine rewrites for this
+      // mount; a POST from it is how the workspace reports a change, and the
+      // published catalog has to follow.
+      res.once('finish', () => {
+        if (req.method === 'POST') void magpieModels?.refresh().catch(() => {})
+      })
+      const upstream = req.url.slice(PREFIX.length + '/engine/ui'.length) || '/'
+      // The engine derives its visible mount from the plugin build's own path
+      // (`/api/our-free-model/engine/ui/`). This console mounts the same UI at a
+      // different prefix, so both the mount it should treat as its own and the
+      // prefix it should emit are passed explicitly instead of guessed.
+      const mount = `${PREFIX}/engine/ui/`
+      await magpieEngine.proxy(req, res, upstream, { prefix: mount, mount })
+      return
     } else if (pathname === `${PREFIX}/workbench` && method === 'GET' && workbench) {
       json(res, 200, { clients: workbench.clients(), accounts: subscriptions?.list() ?? [] })
     } else if (pathname.startsWith(`${PREFIX}/workbench/clients/`) && method === 'POST' && workbench) {
@@ -427,6 +485,6 @@ export function createManagement({ stores, runtime, channels, eac, subscriptions
       }
       return true
     },
-    dispose() { closed = true; bootstrap = null; sessions.clear(); privilegedSessions.clear(); return workbench?.dispose() },
+    dispose() { desktopUpdate.close(); closed = true; bootstrap = null; sessions.clear(); privilegedSessions.clear(); return workbench?.dispose() },
   }
 }

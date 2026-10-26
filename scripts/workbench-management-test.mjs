@@ -5,6 +5,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { once } from 'node:events'
 import { startStandalone } from '../packages/standalone/service.mjs'
+import { pinnedEngineEntry } from './lib/engine-binary.mjs'
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-workbench-http-'))
 const upstream = http.createServer(async (req, res) => {
@@ -75,7 +76,7 @@ try {
     const first = await api('/disclaimer')
     assert.equal(first.status, 200)
     assert.equal(first.body.acknowledged, false, 'a fresh install has not acknowledged it')
-    assert.equal(first.body.version, 1)
+    assert.equal(first.body.version, 2)
     assert.ok(Array.isArray(first.body.sections) && first.body.sections.length >= 3)
     const copy = JSON.stringify(first.body)
     assert.match(copy, /WorkBuddy/i, 'WorkBuddy is named')
@@ -155,6 +156,47 @@ try {
     assert.equal((await api('/routing/save', { combo: { ...group, models: [group.id] } })).status, 400)
     assert.equal((await api('/routing/remove', { id: group.id })).status, 200)
     assert.ok(!(await call('/v1/models')).body.data.some(row => row.id === group.id))
+  })
+  await check('the model workspace starts the real engine and serves its UI from this console', async () => {
+    // The workspace is an integration check against the pinned engine binary,
+    // which only exists for the platforms that were built. A runner without one
+    // has nothing to start, so this group reports that instead of failing.
+    if (pinnedEngineEntry() === null) {
+      console.log(`  ok  skipped: no pinned engine binary for ${process.platform}-${process.arch}`)
+      return
+    }
+    // The desktop console carries the same embedded workspace as the plugin. It
+    // must start the pinned engine, proxy the page under its own mount, and keep
+    // that mount out of reach for anyone without a session.
+    const page = async (route, method = 'GET', authorized = true) => {
+      const response = await fetch(service.url + route, {
+        method, headers: { ...(authorized ? { cookie: managementCookie } : {}) },
+      })
+      return { status: response.status, headers: response.headers, text: await response.text() }
+    }
+    const before = await api('/engine/status')
+    assert.equal(before.status, 200)
+    assert.equal(before.body.state, 'stopped')
+    assert.equal((await api('/engine/start', {})).status, 200)
+    const started = await api('/engine/status')
+    assert.equal(started.body.state, 'ready', JSON.stringify(started.body))
+    const html = await page('/api/management/engine/ui/')
+    assert.equal(html.status, 200)
+    assert.match(html.headers.get('content-type'), /text\/html/)
+    assert.match(html.text, /<html|<!doctype html/i)
+    // Rewritten for this mount, not the plugin's: the page must load its own
+    // assets from the console's prefix.
+    assert.match(html.text, /\/api\/management\/engine\/ui\//)
+    assert.ok(!html.text.includes('/api/our-free-model/engine/ui/'), 'the plugin mount must not leak into this console')
+    const providers = await page('/api/management/engine/ui/api/providers')
+    assert.equal(providers.status, 200)
+    const presets = JSON.parse(providers.text)
+    assert.ok(Array.isArray(presets.presets), 'the workspace reaches the engine API')
+    assert.ok(!JSON.stringify(presets).toLowerCase().includes('huawei'), 'the excluded channel stays out here too')
+    // Same session fence as every other workspace route.
+    assert.equal((await api('/engine/status', undefined, false)).status, 401)
+    assert.equal((await page('/api/management/engine/ui/', 'GET', false)).status, 401)
+    assert.equal((await api('/engine/start', {}, false)).status, 401)
   })
 } finally {
   await service?.close()

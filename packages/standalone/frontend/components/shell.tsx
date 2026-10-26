@@ -1,13 +1,15 @@
-import { Coffee, Activity, Boxes, Cable, ChevronRight, Handshake, LayoutDashboard, LogOut, Moon, Network, Settings2, ShieldCheck, Sun, Monitor, PanelsTopLeft, LibraryBig, Route } from 'lucide-react'
+import { Coffee, Activity, Boxes, Cable, ChevronRight, Handshake, LayoutDashboard, LogOut, Moon, Network, Settings2, ShieldCheck, Sun, Monitor, PanelsTopLeft, LibraryBig, Route, RotateCw } from 'lucide-react'
 import { useState } from 'react'
 import { flushSync } from 'react-dom'
 import brandMark from '../../../../icon.svg?inline'
 import { Badge, Button } from './ui'
 import type { Host, Page, Summary } from '../types'
+import { hasDesktopBridge } from '../desktop-update'
 
 const navigation = [
   { label: '工作空间', items: [
     { id: 'overview', name: '概览', icon: LayoutDashboard },
+    { id: 'workspace', name: '模型工作台', icon: PanelsTopLeft },
     { id: 'agents', name: '客户端与订阅', icon: Monitor },
     { id: 'models', name: '模型清单', icon: Boxes },
     { id: 'usage', name: '用量统计', icon: Activity },
@@ -20,7 +22,7 @@ const navigation = [
     { id: 'eac', name: 'EAC 协付渠道', icon: Handshake },
     { id: 'connection', name: 'API 接入', icon: Cable },
   ] },
-  { label: '管理', items: [{ id: 'settings', name: '服务设置', icon: Settings2 }] },
+  { label: '管理', items: [{ id: 'settings', name: '服务设置', icon: Settings2 }, { id: 'updates', name: '应用更新', icon: RotateCw }] },
   { label: '项目支持', items: [{ id: 'sponsor', name: '来自赞助商的广告', icon: Coffee }] },
 ] as const
 
@@ -71,9 +73,9 @@ export function ThemeToggle() {
 }
 
 export const pageNames: Record<Page, string> = {
-  overview: '概览', models: '模型清单', usage: '用量统计', channels: 'EAC router',
+  overview: '概览', workspace: '模型工作台', models: '模型清单', usage: '用量统计', channels: 'EAC router',
   agents: '客户端与订阅', providers: '聚合渠道', library: '资源库', routing: '路由组',
-  eac: 'EAC 协付渠道', settings: '服务设置', connection: 'API 接入', sponsor: '来自赞助商的广告',
+  eac: 'EAC 协付渠道', settings: '服务设置', updates: '应用更新', connection: 'API 接入', sponsor: '来自赞助商的广告',
 }
 
 export function Sidebar({ page, summary, host, onDisclaimer }: { page: Page; summary?: Summary; host: Host; onDisclaimer(): void }) {
@@ -87,7 +89,7 @@ export function Sidebar({ page, summary, host, onDisclaimer }: { page: Page; sum
     </div>
     <nav className="console-nav" aria-label="管理导航">{navigation.map(group => <div className="nav-group" key={group.label}>
       <span className="nav-group-label">{group.label}</span>
-      {group.items.map(item => <button key={item.id} id={item.id === 'sponsor' ? 'ofm-sponsor-menu-desktop' : undefined} className={`console-nav-item ${item.id === 'sponsor' ? 'ofm-sponsor-nav' : ''} ${page === item.id ? 'selected' : ''}`}
+      {group.items.filter(item => item.id !== 'updates' || hasDesktopBridge()).map(item => <button key={item.id} id={item.id === 'sponsor' ? 'ofm-sponsor-menu-desktop' : undefined} className={`console-nav-item ${item.id === 'sponsor' ? 'ofm-sponsor-nav' : ''} ${page === item.id ? 'selected' : ''}`}
         aria-current={page === item.id ? 'page' : undefined} onClick={() => host.navigate(item.id)}>
         <span className="console-nav-indicator" aria-hidden="true" />
         <item.icon size={18} strokeWidth={1.7} /><span>{item.name}</span>
