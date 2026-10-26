@@ -139,6 +139,7 @@ const suites = [
   ['model-test-finish-integration', 'model-test-finish-integration-test.mjs', []],
   ['bench-integration', 'bench-integration-test.mjs', []],
   ['plugin-bench-ui', 'plugin-bench-ui-test.mjs', []],
+  ['balance-badge', 'balance-badge-test.mjs', []],
   ['gateway-source', 'gateway-source-test.mjs', []],
 ].filter(([name]) => (mode === 'contributor' ? !['manifest', 'release'].includes(name)
   : mode === 'release' ? releaseSuites.has(name) : true)
